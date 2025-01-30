@@ -1,0 +1,5 @@
+# Request
+string table_id
+---
+# Response
+bool success
