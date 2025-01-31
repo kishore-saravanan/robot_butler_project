@@ -1,5 +1,5 @@
-# Request
+# Option 1: Single table + bool
 string table_id
+bool cancel_all
 ---
-# Response
 bool success

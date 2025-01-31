@@ -20,8 +20,8 @@ def generate_launch_description():
     robot_bringup = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([get_package_share_directory('turtlebot3_gazebo'),'/launch','/turtlebot3_cafe.launch.py']),
         launch_arguments={
-        'x_pose':'-3.0',
-        'y_pose': '6.0'}.items(),
+        'x_pose':'-4.0',
+        'y_pose': '1.5'}.items(),
     )
      # Integerating Nav2 Stack
     robot_navigation_bringup = IncludeLaunchDescription(

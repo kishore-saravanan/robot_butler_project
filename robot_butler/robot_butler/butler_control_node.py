@@ -1,396 +1,577 @@
 #!/usr/bin/env python3
 
-import time
+import threading
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionClient
-from nav2_msgs.action import NavigateToPose
+from geometry_msgs.msg import PoseStamped
+from tf_transformations import quaternion_from_euler
+import tkinter as tk
 
-# Custom interfaces
+# Nav2 Simple Commander
+from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
+
+# Custom messages/services
 from robot_butler_interfaces.msg import Order
 from robot_butler_interfaces.srv import Cancel
 
-from geometry_msgs.msg import Quaternion
-from tf_transformations import quaternion_from_euler
+############################################
+#            Global Config & Vars
+############################################
+TIMEOUT_CONFIRMATION = 8.0   # 8s wait at kitchen/table
+STATE_MACHINE_PERIOD = 0.5   # State machine iteration rate
 
-###############################
-#      Config and Helpers     #
-###############################
+SINGLE_TABLE_MODE = False
+MULTIPLE_TABLE_MODE = False
+SKIPPED_OR_CANCELED_ANY_TABLE = False  # If any table is skipped/canceled => final trip to kitchen
 
-TIMEOUT_CONFIRMATION = 5.0  # seconds to wait at kitchen/table for "confirmation"
-STATE_MACHINE_PERIOD = 0.5   # seconds (timer callback frequency)
-
-def euler_to_quaternion(yaw):
-    """
-    Convert a yaw (in radians) to a Quaternion for 2D navigation.
-    We assume roll = pitch = 0.
-    """
-    q = quaternion_from_euler(0.0, 0.0, yaw)
-    return Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
-
-# Named locations in your cafe or simulation:
 NAMED_LOCATIONS = {
-    "home":    (0.0,  0.0,  0.0),   # x=0, y=0, yaw=0
-    "kitchen": (2.5,  3.0,  1.57),  # Just an example
-    "table1":  (4.0,  3.2,  0.0),
-    "table2":  (4.0, -1.0,  3.14),
-    "table3":  (1.0, -2.0,  1.57),
-    # Add or adjust as needed
+    "home":    (-4.0,  1.5,  0.0),
+    "kitchen": (-3.0,  6.0,  1.57),
+    "table1":  (-3.2, -1.2,  -1.57),
+    "table2":  (-0.8, -2.32,  0.0),
+    "table3":  ( 2.57, -1.62, 1.57),
 }
 
+def create_pose_stamped(x, y, yaw, stamp):
+    ps = PoseStamped()
+    ps.header.frame_id = 'map'
+    ps.header.stamp = stamp
+    q = quaternion_from_euler(0.0, 0.0, yaw)
+    ps.pose.position.x = x
+    ps.pose.position.y = y
+    ps.pose.orientation.x = q[0]
+    ps.pose.orientation.y = q[1]
+    ps.pose.orientation.z = q[2]
+    ps.pose.orientation.w = q[3]
+    return ps
 
 class ButlerControlNode(Node):
     """
-    A single node that implements a simple state machine for the robot butler:
-      - Receives multiple orders from /order_topic (Order.msg)
-      - Maintains a queue of tables to deliver
-      - Waits for confirmations at kitchen/table
-      - Handles cancellations via /cancel_topic (Cancel.srv)
+    Covers scenarios #3,#4,#5,#6,#7 with final logic:
+      - If ALL tables are confirmed => direct home after final table (#5).
+      - If ANY table is skipped/canceled => final trip to kitchen => wait => home (#6,#7).
+      - "No confirm => home" at kitchen. 
     """
 
     def __init__(self):
         super().__init__('butler_control_node')
-        self.get_logger().info("ButlerControlNode started.")
+        self.get_logger().info("Butler Control Node Started.")
 
-        # Internal data
         self.state = "IDLE"
-        self.orders_queue = []   # list of table IDs to deliver
+
+        self.orders_queue = []
         self.current_table = None
+
         self.cancel_flag = False
+        self.kitchen_confirmed = False
+        self.table_confirmed   = False
 
-        # We store whether we "timed out" at table or kitchen
-        self.timeout_occurred = False
+        self.kitchen_timer = None
+        self.table_timer   = None
+        self.kitchen_wait_initiated = False
+        self.table_wait_initiated   = False
 
-        # Nav2 action client
-        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        global SKIPPED_OR_CANCELED_ANY_TABLE
+        SKIPPED_OR_CANCELED_ANY_TABLE = False
 
-        # Subscribe to /order_topic
+        self.navigator = BasicNavigator()
+
+        # Subscriptions/Services
         self.create_subscription(Order, '/order_topic', self.order_callback, 10)
-
-        # Service to handle cancellation
         self.create_service(Cancel, '/cancel_topic', self.cancel_callback)
 
-        # State machine step timer
+        # State machine stepping
         self.create_timer(STATE_MACHINE_PERIOD, self.state_machine_step)
 
-    ###############################
-    #   Subscriptions / Services  #
-    ###############################
+        # Launch Tkinter in separate thread
+        self.gui_thread = threading.Thread(target=self.start_gui, daemon=True)
+        self.gui_thread.start()
 
+    ###############################
+    #   Order & Cancel
+    ###############################
     def order_callback(self, msg: Order):
-        """
-        Append new table orders to the queue.
-        Example: msg.table_ids = ["table1", "table3"]
-        """
-        self.get_logger().info(f"Received new order(s): {msg.table_ids}")
-        for table_id in msg.table_ids:
-            self.orders_queue.append(table_id)
+        new_tables = msg.table_ids
+        self.get_logger().info(f"Received Order(s): {new_tables}")
+
+        global SINGLE_TABLE_MODE, MULTIPLE_TABLE_MODE
+
+        for t in new_tables:
+            if t not in self.orders_queue:
+                self.orders_queue.append(t)
+
+        if len(self.orders_queue) == 1:
+            SINGLE_TABLE_MODE = True
+            MULTIPLE_TABLE_MODE = False
+        elif len(self.orders_queue) > 1:
+            SINGLE_TABLE_MODE = False
+            MULTIPLE_TABLE_MODE = True
+
+        self.get_logger().info(f"(DEBUG) SINGLE_TABLE_MODE={SINGLE_TABLE_MODE}, MULTIPLE_TABLE_MODE={MULTIPLE_TABLE_MODE}")
+        self.get_logger().info(f"(DEBUG) Updated queue => {self.orders_queue}")
 
     def cancel_callback(self, request: Cancel, response):
-        """
-        Cancel service. We can handle partial or full cancellation.
-          - If request.cancel_all == True, clear all deliveries.
-          - Else, remove the specified table_id from the queue.
-        """
+        global SKIPPED_OR_CANCELED_ANY_TABLE
         if request.cancel_all:
-            self.get_logger().warn("Cancel ALL deliveries request received.")
+            self.get_logger().warn("CANCEL ALL deliveries.")
             self.orders_queue.clear()
-            # If currently en route, let's set a global cancel to break the state.
             self.cancel_flag = True
+            SKIPPED_OR_CANCELED_ANY_TABLE = True
             response.success = True
-        else:
-            # Cancel only for the specified table
-            if request.table_id:
-                self.get_logger().warn(f"Cancel request for {request.table_id}")
-                # Remove from queue if present
-                if request.table_id in self.orders_queue:
-                    self.orders_queue.remove(request.table_id)
-                    self.get_logger().info(f"Removed {request.table_id} from the queue.")
-                    response.success = True
-                else:
-                    self.get_logger().warn(f"{request.table_id} is not in the queue. Maybe already delivered or invalid.")
-                    response.success = False
+        elif request.table_id:
+            if request.table_id in self.orders_queue:
+                self.get_logger().warn(f"Cancel table: {request.table_id}")
+                self.orders_queue.remove(request.table_id)
+                SKIPPED_OR_CANCELED_ANY_TABLE = True
+                response.success = True
             else:
-                # If neither table_id nor cancel_all is set, do nothing
-                self.get_logger().warn("Cancel service called with no table_id and cancel_all=false.")
+                self.get_logger().warn(f"⚠️ Table {request.table_id} not in queue => can't cancel.")
                 response.success = False
-
+        else:
+            self.get_logger().warn("⚠️ Cancel request invalid (no table_id, no cancel_all).")
+            response.success = False
         return response
 
     ###############################
-    #      STATE MACHINE LOOP     #
+    #         State Machine
     ###############################
-
     def state_machine_step(self):
-        """
-        Called periodically (every 0.5s by default) to step through states.
-        Check for global cancel at the top-level; if canceled, handle scenario #4 logic.
-        """
-        # 1) Global Cancel Check
         if self.cancel_flag and self.state not in ["IDLE", "RETURN_TO_HOME"]:
-            # We only handle immediate global cancel if not already heading home or idle
             self.handle_global_cancellation()
             return
 
-        # 2) Switch on current state
-        if self.state == "IDLE":
-            self.do_idle()
-        elif self.state == "GO_TO_KITCHEN":
-            self.do_go_to_kitchen()
-        elif self.state == "WAIT_KITCHEN_CONFIRM":
-            self.do_wait_kitchen_confirm()
-        elif self.state == "CHECK_ORDERS_QUEUE":
-            self.do_check_orders_queue()
-        elif self.state == "GO_TO_TABLE":
-            self.do_go_to_table()
-        elif self.state == "WAIT_TABLE_CONFIRM":
-            self.do_wait_table_confirm()
-        elif self.state == "RETURN_TO_KITCHEN":
-            self.do_return_to_kitchen()
-        elif self.state == "RETURN_TO_HOME":
-            self.do_return_to_home()
-        else:
-            # Unknown or unimplemented state
-            pass
+        state_methods = {
+            "IDLE": self.do_idle,
+            "GO_TO_KITCHEN": self.do_go_to_kitchen,
+            "WAIT_KITCHEN_CONFIRM": self.do_wait_kitchen_confirm,
+            "CHECK_ORDERS_QUEUE": self.do_check_orders_queue,
+            "GO_TO_TABLE": self.do_go_to_table,
+            "WAIT_TABLE_CONFIRM": self.do_wait_table_confirm,
+            "RETURN_TO_KITCHEN": self.do_return_to_kitchen,
+            "RETURN_TO_HOME": self.do_return_to_home,
+        }
+
+        state_method = state_methods.get(self.state, self.do_idle)
+        state_method()
 
     ###############################
-    #      STATE IMPLEMENTATION   #
+    #   State Implementations
     ###############################
-
     def do_idle(self):
-        """
-        IDLE: Robot is at Home, doing nothing. We check if there's an order in queue.
-        """
         if len(self.orders_queue) > 0:
-            self.get_logger().info("[IDLE] Orders found, going to KITCHEN.")
+            self.get_logger().info("(DEBUG) IDLE => GO_TO_KITCHEN")
             self.state = "GO_TO_KITCHEN"
-        else:
-            # Stay IDLE
-            pass
 
     def do_go_to_kitchen(self):
-        """
-        Travel from Home (or anywhere) to the Kitchen.
-        We do a synchronous Nav2 call. 
-        """
-        self.get_logger().info("[GO_TO_KITCHEN] Navigating to KITCHEN.")
-        success = self.go_to_pose("kitchen")
-        if not success:
-            # If navigation fails, or canceled
-            self.get_logger().warn("[GO_TO_KITCHEN] Navigation failed, returning home.")
+        self.get_logger().info("(DEBUG) do_go_to_kitchen => reset kitchen_wait_initiated.")
+        self.kitchen_wait_initiated = False
+
+        # If there are NO remaining orders, go home instead of the kitchen
+        if not self.orders_queue:
+            self.get_logger().warn("(DEBUG) No orders left after cancel => Going HOME instead of kitchen.")
             self.state = "RETURN_TO_HOME"
-        else:
+            return
+
+        x, y, yaw = NAMED_LOCATIONS["kitchen"]
+        success, interrupt_state = self.go_to_pose(x, y, yaw, 'kitchen')
+        if not success:
+            self.get_logger().warn("(DEBUG) Nav to Kitchen failed => HOME.")
+            self.state = "RETURN_TO_HOME"
+            return
+        if not interrupt_state:
             self.state = "WAIT_KITCHEN_CONFIRM"
+        else:
+            self.state = interrupt_state
+            self.kitchen_confirmed = True
 
     def do_wait_kitchen_confirm(self):
-        """
-        WAIT at the Kitchen for confirmation or time out (Scenario #2, #3).
-        If timed out, go HOME. Otherwise, proceed to check orders.
-        """
-        self.get_logger().info("[WAIT_KITCHEN_CONFIRM] Simulating waiting for kitchen confirmation.")
-        start_time = time.time()
-        self.timeout_occurred = True  # assume we'll time out unless we "simulate" early confirm
+        """No confirm => home, always."""
+        if not self.kitchen_wait_initiated:
+            self.get_logger().info("(DEBUG) WAIT_KITCHEN_CONFIRM => create 8s timer (no confirm => home).")
+            self.kitchen_wait_initiated = True
+            self.kitchen_confirmed = False
+            self.kitchen_timer = self.create_timer(
+                TIMEOUT_CONFIRMATION,
+                self.kitchen_timeout_callback
+            )
+        else:
+            self.get_logger().info("(DEBUG) Already in WAIT_KITCHEN_CONFIRM => no new timer.")
 
-        # We'll poll for half TIMEOUT, then "pretend" we got confirmation.
-        while (time.time() - start_time) < TIMEOUT_CONFIRMATION:
-            # If a cancel flag triggers mid-wait:
-            if self.cancel_flag:
-                self.get_logger().warn("[WAIT_KITCHEN_CONFIRM] Canceled while waiting at kitchen.")
-                self.handle_global_cancellation()
-                return
-            elapsed = time.time() - start_time
-            if elapsed > (TIMEOUT_CONFIRMATION / 2.0):
-                self.get_logger().info("[WAIT_KITCHEN_CONFIRM] Kitchen gave confirmation!")
-                self.timeout_occurred = False
-                break
-            time.sleep(0.2)
+    def kitchen_timeout_callback(self):
+        global SKIPPED_OR_CANCELED_ANY_TABLE
 
-        if self.timeout_occurred:
-            self.get_logger().warn("[WAIT_KITCHEN_CONFIRM] Timed out => returning HOME.")
+        if self.kitchen_timer:
+            self.kitchen_timer.cancel()
+            self.kitchen_timer = None
+        self.kitchen_wait_initiated = False
+
+        self.get_logger().info("(DEBUG) Kitchen Timeout")
+
+        if not self.kitchen_confirmed:
+            self.get_logger().warn("(DEBUG) Kitchen confirm timed out => HOME.")
+            # If this was final wait, we reset skip/cancel so we don't loop
+            SKIPPED_OR_CANCELED_ANY_TABLE = False
+            self.orders_queue.clear()
             self.state = "RETURN_TO_HOME"
         else:
-            self.state = "CHECK_ORDERS_QUEUE"
+            self.get_logger().info("(DEBUG) Kitchen Confirmed => CHECK_ORDERS_QUEUE")
+            # If final wait, also reset skip/cancel
+            SKIPPED_OR_CANCELED_ANY_TABLE = False
+            self.kitchen_confirmed = False
+            if len(self.orders_queue) > 0:
+                self.state = "CHECK_ORDERS_QUEUE"
 
     def do_check_orders_queue(self):
-        """
-        Multiple orders scenario (#5). 
-        If no tables left, go HOME. Else pop next table and deliver.
-        """
-        if len(self.orders_queue) == 0:
-            self.get_logger().info("[CHECK_ORDERS_QUEUE] No more tables. Returning HOME.")
-            self.state = "RETURN_TO_HOME"
-            return
+        global SKIPPED_OR_CANCELED_ANY_TABLE
 
-        # Grab next table from queue
-        self.current_table = self.orders_queue.pop(0)
-        self.get_logger().info(f"[CHECK_ORDERS_QUEUE] Next table: {self.current_table}")
-        self.state = "GO_TO_TABLE"
+        self.get_logger().info(f"(DEBUG) MULTIPLE_TABLE_MODE={MULTIPLE_TABLE_MODE}, SKIPPED_OR_CANCELED_ANY_TABLE={SKIPPED_OR_CANCELED_ANY_TABLE}")
+
+        if len(self.orders_queue) == 0:
+            if MULTIPLE_TABLE_MODE and SKIPPED_OR_CANCELED_ANY_TABLE:
+                self.get_logger().info("(DEBUG) No tables => multi skip/cancel => final => RETURN_TO_KITCHEN => WAIT => home.")
+                self.state = "RETURN_TO_KITCHEN"
+            else:
+                self.get_logger().info("(DEBUG) All delivered => home.")
+                self.state = "RETURN_TO_HOME"
+        else:
+            self.current_table = self.orders_queue[0]
+            self.get_logger().info(f"(DEBUG) Next table => {self.current_table} => GO_TO_TABLE")
+            self.state = "GO_TO_TABLE"
 
     def do_go_to_table(self):
-        """
-        Travel from kitchen to the table.
-        If canceled en route => scenario #4: go to kitchen then home
-        If nav fails => go home
-        """
-        if self.cancel_flag:
-            self.get_logger().warn("[GO_TO_TABLE] We were canceled en route => handle global cancel.")
-            self.handle_global_cancellation()
+        self.get_logger().info("(DEBUG) do_go_to_table => resetting table_wait_initiated.")
+        self.table_wait_initiated = False
+
+        if not self.current_table:
+            self.get_logger().warn("(DEBUG) No current_table => HOME.")
+            self.state = "RETURN_TO_HOME"
             return
 
-        self.get_logger().info(f"[GO_TO_TABLE] Navigating to {self.current_table}.")
-        success = self.go_to_pose(self.current_table)
+        x, y, yaw = NAMED_LOCATIONS[self.current_table]
+        success, interrupt_state = self.go_to_pose(x, y, yaw, self.current_table)
         if not success:
-            self.get_logger().warn("[GO_TO_TABLE] Navigation failed, returning HOME.")
+            self.get_logger().warn("(DEBUG) Nav to table failed => HOME.")
             self.state = "RETURN_TO_HOME"
-        else:
+            return
+        if not interrupt_state:
             self.state = "WAIT_TABLE_CONFIRM"
+        else:
+            self.state = interrupt_state
 
     def do_wait_table_confirm(self):
-        """
-        Wait at table for confirmation (Scenario #3).
-         - If timed out => scenario #6: skip this table, proceed to next
-         - Or scenario #3(b): if no confirm, go to kitchen before home
-        For demonstration:
-         - We assume if we "time out," we skip this table and go to RETURN_TO_KITCHEN.
-         - If confirmed, we move on to next table (CHECK_ORDERS_QUEUE).
-        """
-        self.get_logger().info(f"[WAIT_TABLE_CONFIRM] Waiting at {self.current_table} for confirmation.")
-        start_time = time.time()
-        self.timeout_occurred = True
+        global SKIPPED_OR_CANCELED_ANY_TABLE
 
-        while (time.time() - start_time) < TIMEOUT_CONFIRMATION:
-            if self.cancel_flag:
-                self.get_logger().warn("[WAIT_TABLE_CONFIRM] Cancelled while waiting at table.")
-                self.handle_global_cancellation()
-                return
-
-            elapsed = time.time() - start_time
-            if elapsed > (TIMEOUT_CONFIRMATION / 2.0):
-                self.get_logger().info("[WAIT_TABLE_CONFIRM] Table confirmed receipt.")
-                self.timeout_occurred = False
-                break
-            time.sleep(0.2)
-
-        if self.timeout_occurred:
-            self.get_logger().warn(f"[WAIT_TABLE_CONFIRM] Timed out at {self.current_table}. Skipping it.")
-            # Scenario #3(b) or #6 => go to kitchen first
-            self.state = "RETURN_TO_KITCHEN"
+        if not self.table_wait_initiated:
+            self.get_logger().info(f"(DEBUG) WAIT_TABLE_CONFIRM => create 8s timer for {self.current_table}")
+            self.table_wait_initiated = True
+            self.table_confirmed = False
+            self.table_timer = self.create_timer(
+                TIMEOUT_CONFIRMATION,
+                self.table_timeout_callback
+            )
         else:
-            # Confirmed => go see if there's more tables
+            self.get_logger().info("(DEBUG) Already waiting table confirm => no new timer.")
+
+    def table_timeout_callback(self):
+        global SKIPPED_OR_CANCELED_ANY_TABLE
+
+        if self.table_timer:
+            self.table_timer.cancel()
+            self.table_timer = None
+        self.table_wait_initiated = False
+
+        if not self.table_confirmed:
+            self.get_logger().warn(f"(DEBUG) Table {self.current_table} => no confirm => skipping.")
+            if self.current_table in self.orders_queue:
+                self.orders_queue.remove(self.current_table)
+            SKIPPED_OR_CANCELED_ANY_TABLE = True
+
+            if SINGLE_TABLE_MODE:
+                self.state = "RETURN_TO_KITCHEN"
+            else:
+                self.state = "CHECK_ORDERS_QUEUE"
+            self.current_table = None
+
+        else:
+            self.get_logger().info(f"(DEBUG) Table {self.current_table} confirmed => delivered.")
+            if self.current_table in self.orders_queue:
+                self.orders_queue.remove(self.current_table)
+            self.current_table = None
             self.state = "CHECK_ORDERS_QUEUE"
 
     def do_return_to_kitchen(self):
-        """
-        Return from table to Kitchen, typically after a fail or no confirmation.
-        Then from Kitchen => eventually we go home (Scenario #3(b) or #6).
-        """
-        self.get_logger().info("[RETURN_TO_KITCHEN] Going back to Kitchen.")
-        success = self.go_to_pose("kitchen")
+        self.get_logger().info("(DEBUG) RETURN_TO_KITCHEN => new wait => then HOME.")
+        # reset guard => fresh 8s
+        self.kitchen_wait_initiated = False
+
+        x, y, yaw = NAMED_LOCATIONS["kitchen"]
+        success, interrupt_state = self.go_to_pose(x, y, yaw, 'kitchen_return')
+
         if not success:
-            self.get_logger().warn("[RETURN_TO_KITCHEN] Nav failed. Returning HOME anyway.")
-        self.state = "RETURN_TO_HOME"
+            self.get_logger().warn("(DEBUG) Nav to kitchen failed => HOME.")
+            self.state = "RETURN_TO_HOME"
+            return
+
+        self.state = "WAIT_KITCHEN_CONFIRM"
 
     def do_return_to_home(self):
-        """
-        Finally, go back to HOME. Clear any cancel flags and reset state to IDLE.
-        """
-        self.get_logger().info("[RETURN_TO_HOME] Navigating HOME.")
-        success = self.go_to_pose("home")
-        if success:
-            self.get_logger().info("[RETURN_TO_HOME] Arrived HOME successfully.")
+        self.get_logger().info("(DEBUG) RETURN_TO_HOME => final => IDLE.")
+        x, y, yaw = NAMED_LOCATIONS["home"]
+        success, interrupt_state = self.go_to_pose(x, y, yaw, 'home')
 
-        # Reset data
-        self.cancel_flag = False
+        if not success:
+            self.get_logger().warn("(DEBUG) Nav to home failed => Staying in RETURN_TO_HOME.")
+            self.state = "RETURN_TO_HOME"
+            return
+
+        if not interrupt_state:
+            self.state = "IDLE"
+        else:
+            self.state = interrupt_state
+
+    ############################################
+    #       Tkinter GUI for Confirm
+    ############################################
+    def start_gui(self):
+        root = tk.Tk()
+        root.title("Butler Node (Final Fix)")
+
+        tk.Label(root, text="Robot Buttons", font=("Arial", 14, "bold")).pack(pady=10)
+        tk.Label(root, text="Pick Place Buttons", font=("Arial", 14)).pack(pady=10)
+
+        tk.Button(root, text="Kitchen Confirm", font=("Arial", 14), command=self.kitchen_confirm).pack(pady=10)
+        tk.Button(root, text="Table Confirm",   font=("Arial", 14), command=self.table_confirm).pack(pady=10)
+
+        tk.Label(root, text="Remote Buttons", font=("Arial", 14, "bold")).pack(pady=10)
+
+        for table_num in range(1, 4):
+            table_id = f"table{table_num}"
+            tk.Label(root, text=f"Table {table_num}", font=("Arial", 14)).pack(pady=10)
+
+            tk.Button(root, text=f"Table {table_num} Order", font=("Arial", 14),
+                      command=getattr(self, f"table_place_order_{table_num}")).pack(pady=10)
+            tk.Button(root, text=f"Table {table_num} Cancel", font=("Arial", 14),
+                      command=getattr(self, f"table_cancel_order_{table_num}")).pack(pady=10)
+
+        root.mainloop()
+
+    def kitchen_confirm(self):
+        global SKIPPED_OR_CANCELED_ANY_TABLE
+
+        self.get_logger().info("(DEBUG) Kitchen Confirmed via Button!")
+        self.kitchen_confirmed = True
+
+        if self.kitchen_timer:
+            self.kitchen_timer.cancel()
+            self.kitchen_timer = None
+        self.kitchen_wait_initiated = False
+
+        # If final kitchen wait => reset skip/cancel so we don't loop
+        SKIPPED_OR_CANCELED_ANY_TABLE = False
+        self.state = "CHECK_ORDERS_QUEUE"
+
+    def table_confirm(self):
+        self.get_logger().info("(DEBUG) Table Confirmed via Button!")
+        self.table_confirmed = True
+
+        if self.table_timer:
+            self.table_timer.cancel()
+            self.table_timer = None
+        self.table_wait_initiated = False
+
+        if self.current_table in self.orders_queue:
+            self.get_logger().info(f"(DEBUG) Removing {self.current_table} from queue => {self.orders_queue}")
+            self.orders_queue.remove(self.current_table)
+            self.get_logger().info(f"(DEBUG) Table {self.current_table} confirmed => delivered.")
         self.current_table = None
-        self.state = "IDLE"
+        self.state = "CHECK_ORDERS_QUEUE"
 
-    ###############################
-    #   Global Cancel Handling    #
-    ###############################
+    def table_place_order_1(self):
+        self.get_logger().info("(DEBUG) Table 1 Order Received!")
+        new_tables = ['table1']
+        self.get_logger().info(f"Received Order(s): {new_tables}")
 
+        global SINGLE_TABLE_MODE, MULTIPLE_TABLE_MODE
+
+        for t in new_tables:
+            if t not in self.orders_queue:
+                self.orders_queue.append(t)
+
+        if len(self.orders_queue) == 1:
+            SINGLE_TABLE_MODE = True
+            MULTIPLE_TABLE_MODE = False
+        elif len(self.orders_queue) > 1:
+            SINGLE_TABLE_MODE = False
+            MULTIPLE_TABLE_MODE = True
+
+        self.get_logger().info(f"(DEBUG) SINGLE_TABLE_MODE={SINGLE_TABLE_MODE}, MULTIPLE_TABLE_MODE={MULTIPLE_TABLE_MODE}")
+        self.get_logger().info(f"(DEBUG) Updated queue => {self.orders_queue}")
+
+    def table_cancel_order_1(self):
+        global SKIPPED_OR_CANCELED_ANY_TABLE
+        self.get_logger().info("(DEBUG) Table 1 Order Cancelled!")
+        table_id = 'table1'
+        if table_id in self.orders_queue:
+            self.get_logger().warn(f"Cancel table: {table_id}")
+            self.orders_queue.remove(table_id)
+            SKIPPED_OR_CANCELED_ANY_TABLE = True
+        else:
+            self.get_logger().warn(f"Table {table_id} not in queue => can't cancel.")
+
+    def table_place_order_2(self):
+        self.get_logger().info("(DEBUG) Table 2 Order Received!")
+        new_tables = ['table2']
+        self.get_logger().info(f"Received Order(s): {new_tables}")
+
+        global SINGLE_TABLE_MODE, MULTIPLE_TABLE_MODE
+
+        for t in new_tables:
+            if t not in self.orders_queue:
+                self.orders_queue.append(t)
+
+        if len(self.orders_queue) == 1:
+            SINGLE_TABLE_MODE = True
+            MULTIPLE_TABLE_MODE = False
+        elif len(self.orders_queue) > 1:
+            SINGLE_TABLE_MODE = False
+            MULTIPLE_TABLE_MODE = True
+
+        self.get_logger().info(f"(DEBUG) SINGLE_TABLE_MODE={SINGLE_TABLE_MODE}, MULTIPLE_TABLE_MODE={MULTIPLE_TABLE_MODE}")
+        self.get_logger().info(f"(DEBUG) Updated queue => {self.orders_queue}")
+
+    def table_cancel_order_2(self):
+        global SKIPPED_OR_CANCELED_ANY_TABLE
+        self.get_logger().info("(DEBUG) Table 2 Order Cancelled!")
+        table_id = 'table2'
+        if table_id in self.orders_queue:
+            self.get_logger().warn(f"Cancel table: {table_id}")
+            self.orders_queue.remove(table_id)
+            SKIPPED_OR_CANCELED_ANY_TABLE = True
+        else:
+            self.get_logger().warn(f"Table {table_id} not in queue => can't cancel.")
+
+    def table_place_order_3(self):
+        self.get_logger().info("(DEBUG) Table 3 Order Received!")
+        new_tables = ['table3']
+        self.get_logger().info(f"Received Order(s): {new_tables}")
+
+        global SINGLE_TABLE_MODE, MULTIPLE_TABLE_MODE
+
+        for t in new_tables:
+            if t not in self.orders_queue:
+                self.orders_queue.append(t)
+
+        if len(self.orders_queue) == 1:
+            SINGLE_TABLE_MODE = True
+            MULTIPLE_TABLE_MODE = False
+        elif len(self.orders_queue) > 1:
+            SINGLE_TABLE_MODE = False
+            MULTIPLE_TABLE_MODE = True
+
+        self.get_logger().info(f"(DEBUG) SINGLE_TABLE_MODE={SINGLE_TABLE_MODE}, MULTIPLE_TABLE_MODE={MULTIPLE_TABLE_MODE}")
+        self.get_logger().info(f"(DEBUG) Updated queue => {self.orders_queue}")
+
+    def table_cancel_order_3(self):
+        global SKIPPED_OR_CANCELED_ANY_TABLE
+        self.get_logger().info("(DEBUG) Table 3 Order Cancelled!")
+        table_id = 'table3'
+        if table_id in self.orders_queue:
+            self.get_logger().warn(f"Cancel table: {table_id}")
+            self.orders_queue.remove(table_id)
+            SKIPPED_OR_CANCELED_ANY_TABLE = True
+        else:
+            self.get_logger().warn(f"Table {table_id} not in queue => can't cancel.")
+
+    ############################################
+    #       Nav2 Simple Commander
+    ############################################
+    def go_to_pose(self, x, y, yaw, destination):
+        """
+        Move robot to (x, y, yaw) using Nav2 Simple Commander.
+
+        Returns:
+        - success (bool): Whether navigation was successful
+        - interrupt_state (str | None): Next state if interrupted
+        """
+
+        ps = create_pose_stamped(x, y, yaw, self.get_clock().now().to_msg())
+        self.navigator.goToPose(ps)
+
+        self.get_logger().info(f"(DEBUG) Navigating to {destination} => x={x}, y={y}, yaw={yaw}")
+
+        if self.orders_queue:
+            first_table = self.orders_queue[0]
+        else:
+            first_table = None  # Explicitly set to None instead of string
+
+        # Monitor Navigation Task
+        while not self.navigator.isTaskComplete():
+            if destination in ["home", "kitchen_return"] and not self.orders_queue:
+                continue  # Keep waiting in loop
+
+            if not self.orders_queue or first_table != self.orders_queue[0]:  # Order change detected
+                self.get_logger().warn("(DEBUG) Orders changed mid-navigation! Cancelling task.")
+                self.navigator.cancelTask()
+                # Handle different destinations properly
+                if destination == "kitchen" and not self.orders_queue:
+                    return True, "RETURN_TO_HOME"
+                elif destination == "home":
+                    self.get_logger().info("(DEBUG) Going to Kitchen")
+                    return True, "GO_TO_KITCHEN"
+                elif destination == "kitchen_return":
+                    self.get_logger().info("(DEBUG) Going to Home from Kitchen")
+                    return True, "RETURN_TO_HOME"
+                elif not self.orders_queue:
+                    return True, "RETURN_TO_KITCHEN"
+                else:
+                    return True, "GO_TO_TABLE"
+
+        # Handle final navigation state
+        result = self.navigator.getResult()
+
+        if result == TaskResult.SUCCEEDED:
+            self.get_logger().info("(DEBUG) Navigation SUCCEEDED!")
+            return True, None
+
+        elif result == TaskResult.CANCELED:
+            self.get_logger().warn("(DEBUG) Navigation CANCELED!")
+            return False, "RETURN_TO_HOME"
+
+        elif result == TaskResult.FAILED:
+            self.get_logger().warn("(DEBUG) Navigation FAILED!")
+            return False, None  # Stay in current state
+
+        else:
+            self.get_logger().warn("(DEBUG) Unknown navigation result!")
+            return False, None
+
+    ############################################
+    #         Handle Global Cancel (#4)
+    ############################################
     def handle_global_cancellation(self):
-        """
-        Scenario #4:
-          - If canceled while going to Kitchen => go HOME
-          - If canceled while going to Table => go KITCHEN then HOME
-          - Or if canceled while waiting, handle accordingly
-        """
-        # Clear partial deliveries if we want to. 
-        # Or you can keep the queue if it's a partial cancel, 
-        # but here we interpret global cancel as "Stop everything."
+        global SKIPPED_OR_CANCELED_ANY_TABLE
+        SKIPPED_OR_CANCELED_ANY_TABLE = True
+
         self.orders_queue.clear()
 
         if self.state == "GO_TO_KITCHEN":
-            self.get_logger().warn("[GlobalCancel] Canceled en route to Kitchen => returning HOME.")
+            self.get_logger().warn("(DEBUG) Cancel en route kitchen => HOME.")
             self.state = "RETURN_TO_HOME"
         elif self.state == "GO_TO_TABLE":
-            self.get_logger().warn("[GlobalCancel] Canceled en route to Table => go to KITCHEN => then HOME.")
+            self.get_logger().warn("(DEBUG) Cancel en route table => KITCHEN => HOME.")
             self.state = "RETURN_TO_KITCHEN"
         else:
-            self.get_logger().warn("[GlobalCancel] Transitioning to HOME.")
+            self.get_logger().warn("(DEBUG) Global Cancel => HOME.")
             self.state = "RETURN_TO_HOME"
 
         self.cancel_flag = False
 
-    ###############################
-    #       Nav2 Integration      #
-    ###############################
-
-    def go_to_pose(self, location_name: str) -> bool:
-        """
-        Send a NavigateToPose goal to Nav2 for the named location.
-        Blocks until the action completes or fails.
-        Returns True if succeeded, False if canceled/failure.
-        """
-        if location_name not in NAMED_LOCATIONS:
-            self.get_logger().error(f"Unknown location: {location_name}")
-            return False
-
-        (x, y, yaw) = NAMED_LOCATIONS[location_name]
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose.header.frame_id = 'map'
-        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
-        goal_msg.pose.pose.position.x = x
-        goal_msg.pose.pose.position.y = y
-        goal_msg.pose.pose.orientation = euler_to_quaternion(yaw)
-
-        # Wait for Nav2 action server
-        if not self.nav_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("Nav2 Action Server not available!")
-            return False
-
-        self.get_logger().info(f"Sending Nav2 goal to {location_name}: (x={x}, y={y}, yaw={yaw})")
-        send_goal_future = self.nav_client.send_goal_async(goal_msg)
-        rclpy.spin_until_future_complete(self, send_goal_future)
-        goal_handle = send_goal_future.result()
-        if not goal_handle.accepted:
-            self.get_logger().warn("Nav2 goal was rejected.")
-            return False
-
-        self.get_logger().info("Nav2 goal accepted. Waiting for result...")
-        get_result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, get_result_future)
-        result_status = get_result_future.result().status
-
-        # 4 => SUCCEEDED per action_msgs/GoalStatus
-        if result_status == 4:
-            self.get_logger().info("Navigation SUCCEEDED!")
-            return True
-        else:
-            self.get_logger().warn(f"Navigation failed with status={result_status}")
-            return False
-
-
-def main(args=None):
-    rclpy.init(args=args)
+def main():
+    rclpy.init()
     node = ButlerControlNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()
