@@ -196,6 +196,7 @@ class ButlerControlNode(Node):
             )
         else:
             self.get_logger().info("(DEBUG) Already in WAIT_KITCHEN_CONFIRM => no new timer.")
+            print("Please press Confirmation Button")
 
     def kitchen_timeout_callback(self):
         global SKIPPED_OR_CANCELED_ANY_TABLE
@@ -271,6 +272,7 @@ class ButlerControlNode(Node):
             )
         else:
             self.get_logger().info("(DEBUG) Already waiting table confirm => no new timer.")
+            print("Please press Confirmation Button")
 
     def table_timeout_callback(self):
         global SKIPPED_OR_CANCELED_ANY_TABLE

@@ -3,7 +3,7 @@
 <package format="3">
   <name>robot_butler</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Robot Butler Simulation and Control Package</description>
   <maintainer email="kishoresaravanan2002@gmail.com">Kishore</maintainer>
   <license>TODO: License declaration</license>
 
