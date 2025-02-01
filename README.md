@@ -99,7 +99,7 @@ Preemption is handled during navigation by periodically checking a command queue
 
 ## Screenshots
 
-### Environment Screenshot
+### Gazebo Simulation Environment Screenshot
 
 ![gazebo cafe world](https://github.com/user-attachments/assets/6edd1e4d-93d1-41e1-b250-ca0fc2471399)
 
@@ -108,7 +108,7 @@ Preemption is handled during navigation by periodically checking a command queue
 
 ![Screenshot from 2025-02-01 08-01-39](https://github.com/user-attachments/assets/7fb1c0d4-37c8-4222-a00e-007b6f7af504)
 
-### NAvigation with GUI Input Screenshot
+### Navigation with GUI Input Screenshot
 
 ![image](https://github.com/user-attachments/assets/28726e05-c2c8-4357-a1e4-d7f71696a12c)
 
