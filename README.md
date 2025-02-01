@@ -1,5 +1,3 @@
-![image](https://github.com/user-attachments/assets/96d88ac2-146a-43a0-a0a4-1c2d2f37da8a)# Robot Butler Project
-
 ## Overview
 
 The **Robot Butler Project** is an autonomous solution designed for busy café environments. In this project, a TurtleBot3-based robot operates in a custom café world in Gazebo using the Nav2 navigation stack. The robot performs order delivery tasks by autonomously moving from its home base to the kitchen and then to customer tables. Order requests and cancellations are handled by dedicated buttons in the GUI, and the robot’s behavior is managed by an internal Finite State Machine (FSM).
